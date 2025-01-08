@@ -1,0 +1,142 @@
+trigger:
+  branches:
+    include:
+      - master
+  paths:
+    include: 
+      - 'MWP.Notification.FunctionApp/*'
+
+parameters:
+  - name: deployOffOfBranch
+    type: boolean
+    default: false
+  - name: provisionResources
+    type: boolean
+    default: false
+
+pool:
+  vmImage: 'windows-latest'
+
+variables:
+  - group: OgpUrls
+  - group: Azure
+  - name: storageName
+    value: 'notification'
+  - name: appName
+    value: 'intnotificationservice'      
+  - name:  artifactName
+    value: 'Notification'
+  - group: OgpUrls
+  - name: functionProject
+    value: 'MWP.Notification.FunctionApp/MWP.Notification.FunctionApp.csproj'
+  - name: buildConfiguration
+    value: 'Release'
+  - name: deploymentMethod
+    value: 'auto'    
+
+stages:
+  - stage: BuildAndPublish
+    jobs: 
+    - job:
+      displayName: 'Build functions'
+      steps:
+
+        - task: SonarQubePrepare@6
+          inputs:
+            SonarQube: 'SonarQube Connection'
+            scannerMode: 'MSBuild'
+            projectKey: 'MWPINT-Notification'
+            projectName: 'MWPINT-Notification'
+            extraProperties: |
+              sonar.cs.opencover.reportsPaths=**/coverage.opencover.xml
+              sonar.exclusions=**/Tests/**/*  
+
+        - task: UseDotNet@2
+          displayName: 'Install .NET 8 SDK'
+          inputs:
+            packageType: 'sdk'
+            version: 8.x
+
+        - task: DotNetCoreCLI@2
+          displayName: 'restore'
+          inputs:
+            command: restore
+            projects: "${{variables.functionProject}}"
+            feedsToUse: 'select'
+            vstsFeed: 'OGP-Packages'
+
+        - task: DotNetCoreCLI@2
+          displayName: 'build'
+          inputs:
+            command: build
+            projects: '${{variables.functionProject}}'
+            arguments: '--configuration $(buildConfiguration) --no-restore'
+        
+        - task: DotNetCoreCLI@2
+          displayName: 'test'
+          inputs:
+            command: test
+            projects: '**/*Tests*/*Tests.csproj'
+            arguments: '--configuration $(buildConfiguration) --collect "Code coverage"'
+
+        - task: SonarQubeAnalyze@6
+        - task: SonarQubePublish@6
+          inputs:
+            pollingTimeoutSec: '300'
+
+        - task: DotNetCoreCLI@2
+          displayName: 'publish functions'
+          inputs:
+            command: publish
+            publishWebProjects: false
+            projects: ${{variables.functionProject}}
+            modifyOutputPath: true
+            arguments: '--configuration ${{variables.buildConfiguration}} --output $(Build.ArtifactStagingDirectory)\${{variables.functionProject}} --no-restore'
+            zipAfterPublish: true
+
+        - task: PublishPipelineArtifact@1
+          displayName: 'publish functions artifact'
+          inputs:
+            targetPath: '$(Build.ArtifactStagingDirectory)\${{variables.functionProject}}'
+            artifactName: ${{variables.artifactName}}
+
+################################### QA Stage #############################################
+
+  - stage: DeployAzureResourcesToQa
+    jobs:
+    - deployment:
+      displayName: 'Deploy functions to QA'      
+      environment: 'Qa'
+      pool:
+        vmImage: 'windows-latest'
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - task: AzureFunctionApp@1
+              displayName: 'Deploy Functions'             
+              inputs:
+                appType: 'functionApp'
+                appName: 'func-${{variables.appName}}-qa-neu'
+                package: '$(Pipeline.Workspace)/${{variables.artifactName}}/*.zip'
+                deploymentMethod: ${{variables.deploymentMethod}}         
+                azureSubscription: 'mwpts-nonprod'
+                  
+            - task: AzureCLI@2
+              displayName: 'Set function settings'
+              inputs:
+                azureSubscription: 'mwpts-nonprod'
+                scriptType: 'bash'
+                scriptLocation: 'inlineScript'
+                inlineScript: |
+                  az functionapp function keys set -n func-'${{variables.appName}}'-qa-neu -g rg-iwpt-${{variables.appName}}-qa --function-name NotificationFunction
+                  az functionapp config appsettings set -n func-'${{variables.appName}}'-qa-neu -g rg-iwpt-${{variables.appName}}-qa --settings "SendGridApiKey=$(SendGridApiKey.Qa)"
+                  az functionapp config appsettings set -n func-'${{variables.appName}}'-qa-neu -g rg-iwpt-${{variables.appName}}-qa --settings "FunctionName=$(FunctionName.Qa)"
+                  az functionapp config appsettings set -n func-'${{variables.appName}}'-qa-neu -g rg-iwpt-${{variables.appName}}-qa --settings "BlobConnectionString=$(BlobConnectionString.Qa)"
+                  az functionapp config appsettings set -n func-'${{variables.appName}}'-qa-neu -g rg-iwpt-${{variables.appName}}-qa --settings "BlobContainerName=$(BlobContainerName.Qa)"
+                  az functionapp config appsettings set -n func-'${{variables.appName}}'-qa-neu -g rg-iwpt-${{variables.appName}}-qa --settings "CosmosConnectionString=$(CosmosConnectionString.Qa)"
+                  az functionapp config appsettings set -n func-'${{variables.appName}}'-qa-neu -g rg-iwpt-${{variables.appName}}-qa --settings "CosmosDatabaseId=$(CosmosDatabaseId.Qa)"
+                  az functionapp config appsettings set -n func-'${{variables.appName}}'-qa-neu -g rg-iwpt-${{variables.appName}}-qa --settings "CosmosContainerId=$(CosmosContainerId.Qa)"
+                  az functionapp restart -n func-'${{variables.appName}}'-qa-neu -g rg-iwpt-${{variables.appName}}-qa
+
+
